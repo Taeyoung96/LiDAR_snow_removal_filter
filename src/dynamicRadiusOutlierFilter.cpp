@@ -15,9 +15,17 @@
 #include <string>
 #include <vector>
 
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <pcl/kdtree/kdtree_flann.h>
+
+std::queue<sensor_msgs::PointCloud2ConstPtr> dataQueue;
+std::mutex queueMutex;
+
 typedef std::chrono::system_clock::time_point TimePoint;
 
-ros::Publisher pubOutputPoints, pubAvgDuration, pubAvgRate;
+ros::Publisher pubOutputPoints, pubConvertPoints, pubAvgDuration, pubAvgRate;
 ros::Duration currentDuration(0), accumDuration(0);
 ros::Time begin;
 std::string inputTopic, outputDirectory, outputDirectoryClouds,
@@ -27,6 +35,27 @@ double radiusSearch, multiplier, azAngle, minSR;
 std_msgs::Float64 averageDuration, averageRate;
 int minNeighbours, noCloudsProcessed = 0;
 std::vector<std::string> timestamps;
+
+struct PointXYZIR
+{
+  PCL_ADD_POINT4D;  // Add XYZ
+  float intensity;
+  float time;
+  uint16_t ring;
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW  // Ensure proper alignment
+}; 
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZIR,
+                                  (float, x, x)
+                                  (float, y, y)
+                                  (float, z, z)
+                                  (float, intensity, intensity)
+                                  (float, time, time)
+                                  (std::uint16_t, ring, ring)
+)
+
+typedef PointXYZIR PointT;
+typedef pcl::PointCloud<PointT> PointCloudT;
 
 TimePoint rosTimeToChrono(const std_msgs::Header& hdr) {
   std::chrono::seconds secs(hdr.stamp.sec);
@@ -130,63 +159,132 @@ void writeTimeStamps() {
   file.close();
 }
 
+
+void filterExactCommonPoints(const pcl::PointCloud<PointT>::Ptr &cloud_input_PointT,
+                             const pcl::PointCloud<pcl::PointXYZI>::Ptr &cloud_filtered,
+                             pcl::PointCloud<PointT>::Ptr &cloud_output_PointT) {
+  
+  pcl::KdTreeFLANN<pcl::PointXYZI> kdtree;
+  kdtree.setInputCloud(cloud_filtered);
+
+  for (const auto &pointT : cloud_input_PointT->points) {
+    pcl::PointXYZI pointXYZI;
+    pointXYZI.x = pointT.x;
+    pointXYZI.y = pointT.y;
+    pointXYZI.z = pointT.z;
+    
+    std::vector<int> pointIdxNKNSearch;
+    std::vector<float> pointNKNSquaredDistance;
+    
+    if (kdtree.nearestKSearch(pointXYZI, 1, pointIdxNKNSearch, pointNKNSquaredDistance) > 0) {
+      if (pointNKNSquaredDistance[0] == 0.0) {
+        cloud_output_PointT->points.push_back(pointT);
+      }
+    }
+  }
+
+  cloud_output_PointT->width = cloud_output_PointT->points.size();
+  cloud_output_PointT->height = 1;
+  cloud_output_PointT->is_dense = true;
+}
+
+
 void cloud_cb(const sensor_msgs::PointCloud2ConstPtr &cloud_msg) {
-  // Count number of point clouds processed
-  noCloudsProcessed++;
+  std::lock_guard<std::mutex> lock(queueMutex);
+  dataQueue.push(cloud_msg);
+}
 
-  // Container for original & filtered data
-  pcl::PCLPointCloud2 input_cloud2;
-  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_input(
-      new pcl::PointCloud<pcl::PointXYZI>());
-  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_filtered(
-      new pcl::PointCloud<pcl::PointXYZI>());
+void process_data() {
+  while (ros::ok()) {
+    queueMutex.lock();
+    if (!dataQueue.empty()) {
+      sensor_msgs::PointCloud2ConstPtr cloud_msg = dataQueue.front();
+      dataQueue.pop();
+      queueMutex.unlock();
 
-  // Convert to PCL data type
-  pcl_conversions::toPCL(*cloud_msg, input_cloud2);
+      // Count number of point clouds processed
+      noCloudsProcessed++;
 
-  // Convert to from PointCloud2
-  pcl::fromPCLPointCloud2(input_cloud2, *cloud_input);
+      // Container for original & filtered data
+      pcl::PCLPointCloud2 input_cloud_;
+      pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_input(
+          new pcl::PointCloud<pcl::PointXYZI>());
+      pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_filtered(
+          new pcl::PointCloud<pcl::PointXYZI>());
 
-  // Perform filtering
-  DROR outrem;
-  outrem.SetRadiusMultiplier(multiplier);
-  outrem.SetAzimuthAngle(azAngle);
-  outrem.SetMinSearchRadius(minSR);
-  outrem.SetMinNeighbors(minNeighbours);
+      pcl::PointCloud<PointT>::Ptr cloud_input_PointT(
+          new pcl::PointCloud<PointT>());
+      pcl::PointCloud<PointT>::Ptr cloud_output_PointT(
+          new pcl::PointCloud<PointT>());
 
-  // Get current time:
-  ros::Time begin = ros::Time::now();
+      // Convert to PCL data type
+      pcl_conversions::toPCL(*cloud_msg, input_cloud_);
+      // Convert to from PointCloud2
+      pcl::fromPCLPointCloud2(input_cloud_, *cloud_input);
+      pcl::fromPCLPointCloud2(input_cloud_, *cloud_input_PointT);
 
-  // apply filter
-  outrem.Filter<pcl::PointXYZI>(cloud_input, *cloud_filtered);
+      // Perform filtering
+      DROR outrem;
+      outrem.SetRadiusMultiplier(multiplier);
+      outrem.SetAzimuthAngle(azAngle);
+      outrem.SetMinSearchRadius(minSR);
+      outrem.SetMinNeighbors(minNeighbours);
 
-  // Get duration
-  currentDuration = ros::Time::now() - begin;
+      // Get current time:
+      ros::Time begin = ros::Time::now();
 
-  // Calculate average duration
-  accumDuration = accumDuration + currentDuration;
-  averageDuration.data = accumDuration.toSec() / noCloudsProcessed;
-  averageRate.data = 1 / averageDuration.data;
+      // apply filter
+      outrem.Filter<pcl::PointXYZI>(cloud_input, *cloud_filtered);
 
-  // Convert to pointcloud2 data type
-  pcl::PCLPointCloud2 cloud_filtered_2;
-  pcl::toPCLPointCloud2(*cloud_filtered, cloud_filtered_2);
+      // Get duration
+      currentDuration = ros::Time::now() - begin;
 
-  // Convert to ros msg
-  sensor_msgs::PointCloud2 cloud_filtered_msg;
-  pcl_conversions::fromPCL(cloud_filtered_2, cloud_filtered_msg);
+      // Calculate average duration
+      accumDuration = accumDuration + currentDuration;
+      averageDuration.data = accumDuration.toSec() / noCloudsProcessed;
+      averageRate.data = 1 / averageDuration.data;
 
-  // copy header info
-  cloud_filtered_msg.header = cloud_msg->header;
 
-  // Publish the data
-  pubOutputPoints.publish(cloud_filtered_msg);
-  pubAvgDuration.publish(averageDuration);
-  pubAvgRate.publish(averageRate);
+      filterExactCommonPoints(cloud_input_PointT, cloud_filtered, cloud_output_PointT);
 
-  if (writeToKitty) {
-    writeCloud(cloud_filtered);
-    timestamps.push_back(convertTimeToKitty(cloud_msg->header));
+
+      // Convert to pointcloud2 data type
+      pcl::PCLPointCloud2 cloud_filtered_2;
+      pcl::toPCLPointCloud2(*cloud_filtered, cloud_filtered_2);
+
+      // Convert to ros msg
+      sensor_msgs::PointCloud2 cloud_filtered_msg;
+      pcl_conversions::fromPCL(cloud_filtered_2, cloud_filtered_msg);
+      cloud_filtered_msg.header = cloud_msg->header;
+
+      // Convert to ros msg
+      pcl::PCLPointCloud2 cloud_filtered_3;
+      pcl::toPCLPointCloud2(*cloud_output_PointT, cloud_filtered_3);
+
+      // Convert to ros msg
+      sensor_msgs::PointCloud2 cloud_converted_msg;
+      pcl_conversions::fromPCL(cloud_filtered_3, cloud_converted_msg);
+      cloud_converted_msg.header = cloud_msg->header;
+
+      // Publish the data
+      pubConvertPoints.publish(cloud_converted_msg); 
+      pubOutputPoints.publish(cloud_filtered_msg);
+      pubAvgDuration.publish(averageDuration);
+      pubAvgRate.publish(averageRate);
+
+      
+      ROS_INFO("Finished processing point cloud");
+      ROS_INFO("Data queue size: %d", dataQueue.size());
+
+      // if (writeToKitty) {
+      //   writeCloud(cloud_filtered);
+      //   timestamps.push_back(convertTimeToKitty(cloud_msg->header));
+      // }
+
+    } else {
+      queueMutex.unlock();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
   }
 }
 
@@ -234,12 +332,19 @@ int main(int argc, char **argv) {
   // Create a ROS subscriber for the input point cloud
   ros::Subscriber sub = nh.subscribe(inputTopic, 10, cloud_cb);
 
+  // Create a thread to process the data
+  std::thread processingThread(process_data);
+
   // Create a ROS publisher for the output point cloud
+  pubConvertPoints =
+      nh.advertise<sensor_msgs::PointCloud2>("/DROR/converted", 1);
   pubOutputPoints = nh.advertise<sensor_msgs::PointCloud2>("/DROR/output", 1);
   pubAvgDuration =
       nh.advertise<std_msgs::Float64>("/DROR/AverageProcessTime", 1);
   pubAvgRate = nh.advertise<std_msgs::Float64>("/DROR/AverageProcessRate", 1);
 
   ros::spin();
+  processingThread.join();
+
   return 0;
 }
